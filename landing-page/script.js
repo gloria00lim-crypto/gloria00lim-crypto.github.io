@@ -7,28 +7,176 @@
  */
 
 document.addEventListener('DOMContentLoaded', () => {
-    initCtaButtons();
+    initGa4Tracking();
     initFaqAccordion();
     initModalEvents();
 });
 
 /**
- * 1. CTA 버튼 이벤트 초기화
- * - 첫 화면(#cta-hero), 최하단(#cta-final-btn), 헤더(#cta-mini) 등 구분
+ * GA4 이벤트 안전 전송 헬퍼 함수
+ * - GA 차단/미로드 시에도 예외 없이 안전하게 무시
+ * - PII 미수집, debug_mode 강제 활성화 없음
+ */
+function sendGaEvent(eventName, params) {
+    try {
+        if (typeof window.gtag === 'function') {
+            window.gtag('event', eventName, params);
+        }
+    } catch (err) {
+        console.warn(`[GA4] 이벤트 전송 예외 안전 처리 (${eventName}):`, err);
+    }
+}
+
+/**
+ * GA4 측정 초기화 (중복 실행 방지 가드 포함)
+ */
+function initGa4Tracking() {
+    if (window.__ga4_tracking_initialized) {
+        return;
+    }
+    window.__ga4_tracking_initialized = true;
+
+    initSectionViewTracking();
+    initCtaButtons();
+}
+
+/**
+ * 1. 구간 도달(section_view) 측정
+ * - #hero-title → hero
+ * - #detail-space-title → detail
+ * - #purchase-title → cta
+ * - 제목 면적 50% 이상 노출 시 1회만 전송
+ * - 고정 헤더 가림 높이(64px) 제외
+ * - 문서 활성(visibilityState === 'visible') 시에만 전송
+ * - 탭 복귀 시 화면에 보이는 제목 누락 방지
+ */
+function initSectionViewTracking() {
+    const sectionTargets = [
+        { id: 'hero-title', name: 'hero' },
+        { id: 'detail-space-title', name: 'detail' },
+        { id: 'purchase-title', name: 'cta' }
+    ];
+
+    const viewedSections = new Set();
+    const targetMap = new Map(); // element -> section_name
+
+    const headerEl = document.querySelector('header') || document.getElementById('header');
+    const headerHeight = headerEl ? headerEl.offsetHeight : 64;
+
+    const observerOptions = {
+        root: null,
+        rootMargin: `-${headerHeight}px 0px 0px 0px`, // 고정 헤더 영역 제외
+        threshold: 0.5                               // 제목 면적 50% 이상
+    };
+
+    function triggerSectionView(element, sectionName) {
+        if (viewedSections.has(sectionName)) return;
+        viewedSections.add(sectionName);
+
+        sendGaEvent('section_view', {
+            section_name: sectionName
+        });
+        console.log(`[GA4] section_view 전송: section_name=${sectionName}`);
+
+        if (observer && element) {
+            observer.unobserve(element);
+        }
+    }
+
+    let observer = null;
+    if ('IntersectionObserver' in window) {
+        observer = new IntersectionObserver((entries) => {
+            entries.forEach(entry => {
+                const sectionName = targetMap.get(entry.target);
+                if (!sectionName || viewedSections.has(sectionName)) return;
+
+                if (entry.isIntersecting && entry.intersectionRatio >= 0.5) {
+                    if (document.visibilityState === 'visible') {
+                        triggerSectionView(entry.target, sectionName);
+                    }
+                }
+            });
+        }, observerOptions);
+    }
+
+    // 관찰 대상 제목 요소 등록
+    sectionTargets.forEach(({ id, name }) => {
+        const el = document.getElementById(id);
+        if (el) {
+            targetMap.set(el, name);
+            if (observer) {
+                observer.observe(el);
+            }
+        }
+    });
+
+    // 탭 복귀(visibilitychange) 시 현재 뷰포트에 50% 이상 보이는 제목 감지
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState !== 'visible') return;
+
+        targetMap.forEach((name, el) => {
+            if (viewedSections.has(name)) return;
+
+            const rect = el.getBoundingClientRect();
+            const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
+
+            const visibleTop = Math.max(rect.top, headerHeight);
+            const visibleBottom = Math.min(rect.bottom, viewportHeight);
+            const visibleHeight = Math.max(0, visibleBottom - visibleTop);
+
+            if (rect.height > 0 && (visibleHeight / rect.height) >= 0.5) {
+                triggerSectionView(el, name);
+            }
+        });
+    });
+}
+
+/**
+ * 2. CTA 버튼 이벤트 및 클릭(cta_click) 측정 초기화
+ * - #cta-hero / [data-cta-location="hero"] → hero
+ * - #cta-final / #cta-final-btn / [data-cta-location="final"] → final
+ * - 중복 리스너 등록 방지 (Map 고유 요소 매핑)
+ * - 일반 클릭 및 키보드 Enter 활성화 시 1회 전송
+ * - 재클릭 시 매번 전송
+ * - 기본 링크 이동(새 탭) 방해/지연 없음
  */
 function initCtaButtons() {
-    const ctaButtons = document.querySelectorAll('[data-cta-location]');
+    const ctaMap = new Map();
 
-    ctaButtons.forEach(button => {
-        button.addEventListener('click', (event) => {
-            const location = button.getAttribute('data-cta-location');
-            console.log(`[CTA Clicked] Location: ${location}, ID: ${button.id}`);
-            
-            // 실제 외부 링크(쿠팡 파트너스 등)가 설정된 경우 자연스러운 새 탭 이동 허용
-            if (button.tagName === 'A' && button.hasAttribute('href') && button.getAttribute('href') !== '#') {
+    const heroBtn = document.querySelector('#cta-hero, [data-cta-location="hero"]');
+    if (heroBtn) {
+        ctaMap.set(heroBtn, 'hero');
+    }
+
+    const finalBtn = document.querySelector('#cta-final, #cta-final-btn, [data-cta-location="final"]');
+    if (finalBtn) {
+        ctaMap.set(finalBtn, 'final');
+    }
+
+    // 헤더 미니 CTA 등 기타 CTA 요소 등록
+    const otherCtas = document.querySelectorAll('[data-cta-location]:not(#cta-hero):not(#cta-final):not(#cta-final-btn)');
+    otherCtas.forEach(btn => {
+        if (!ctaMap.has(btn)) {
+            ctaMap.set(btn, btn.getAttribute('data-cta-location') || 'other');
+        }
+    });
+
+    ctaMap.forEach((location, element) => {
+        element.addEventListener('click', (event) => {
+            // hero 또는 final CTA일 때 GA4 cta_click 이벤트 전송
+            if (location === 'hero' || location === 'final') {
+                sendGaEvent('cta_click', {
+                    button_location: location
+                });
+                console.log(`[GA4] cta_click 전송: button_location=${location}`);
+            }
+
+            // 실제 외부 링크(쿠팡 파트너스 등)가 설정된 경우 자연스러운 새 탭 이동 허용 (지연/차단 없음)
+            if (element.tagName === 'A' && element.hasAttribute('href') && element.getAttribute('href') !== '#') {
                 return;
             }
 
+            // 미연결 버튼(모달 안내 대상)인 경우에만 기본 동작 방지 및 모달 노출
             event.preventDefault();
             openCtaModal();
         });
